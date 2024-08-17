@@ -32,10 +32,10 @@ from fastchat.serve.gradio_web_server import (
     get_ip,
     get_model_description_md,
 )
+from fastchat.serve.moderation.moderator import AzureAndOpenAIContentModerator
 from fastchat.serve.remote_logger import get_remote_logger
 from fastchat.utils import (
     build_logger,
-    moderation_filter,
 )
 
 logger = build_logger("gradio_web_server_multi", "gradio_web_server_multi.log")
@@ -201,6 +201,9 @@ def get_battle_pair(
     if len(models) == 1:
         return models[0], models[0]
 
+    if len(models) == 0:
+        raise ValueError("There are no models provided. Cannot get battle pair.")
+
     model_weights = []
     for model in models:
         weight = get_sample_weight(
@@ -289,7 +292,11 @@ def add_text(
     all_conv_text = (
         all_conv_text_left[-1000:] + all_conv_text_right[-1000:] + "\nuser: " + text
     )
-    flagged = moderation_filter(all_conv_text, model_list, do_moderation=True)
+
+    content_moderator = AzureAndOpenAIContentModerator()
+    flagged = content_moderator.text_moderation_filter(
+        all_conv_text, model_list, do_moderation=True
+    )
     if flagged:
         logger.info(f"violate moderation (anony). ip: {ip}. text: {text}")
         # overwrite the original text

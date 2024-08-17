@@ -30,10 +30,14 @@ from fastchat.serve.gradio_block_arena_vision import (
     set_invisible_image,
     set_visible_image,
     add_image,
-    moderate_input,
     _prepare_text_with_image,
     convert_images_to_conversation_format,
-    enable_multimodal,
+    enable_multimodal_keep_input,
+    enable_multimodal_clear_input,
+)
+from fastchat.serve.moderation.moderator import (
+    BaseContentModerator,
+    AzureAndOpenAIContentModerator,
 )
 from fastchat.serve.gradio_web_server import (
     State,
@@ -51,8 +55,6 @@ from fastchat.serve.gradio_web_server import (
 from fastchat.serve.remote_logger import get_remote_logger
 from fastchat.utils import (
     build_logger,
-    moderation_filter,
-    image_moderation_filter,
 )
 
 
@@ -67,7 +69,7 @@ def clear_history_example(request: gr.Request):
     return (
         [None] * num_sides
         + [None] * num_sides
-        + [enable_multimodal]
+        + [enable_multimodal_keep_input]
         + [invisible_btn] * 4
         + [disable_btn] * 2
     )
@@ -151,7 +153,7 @@ def clear_history(request: gr.Request):
     return (
         [None] * num_sides
         + [None] * num_sides
-        + [enable_multimodal]
+        + [enable_multimodal_clear_input]
         + [invisible_btn] * 4
         + [disable_btn] * 2
     )
@@ -193,9 +195,19 @@ def add_text(
 
     images = convert_images_to_conversation_format(images)
 
-    text, image_flagged, csam_flag = moderate_input(
-        state0, text, all_conv_text, model_list, images, ip
-    )
+    content_moderator = AzureAndOpenAIContentModerator()
+    text_flagged = content_moderator.text_moderation_filter(text, model_list)
+    if len(images) > 0:
+        nsfw_flag, csam_flag = content_moderator.image_moderation_filter(images[0])
+        image_flagged = nsfw_flag or csam_flag
+        if csam_flag:
+            states[0].has_csam_image, states[1].has_csam_image = True, True
+    else:
+        image_flagged = False
+
+    if text_flagged or image_flagged:
+        logger.info(f"violate moderation. ip: {ip}. text: {text}")
+        content_moderator.write_to_json(get_ip(request))
 
     conv = states[0].conv
     if (len(conv.messages) - conv.offset) // 2 >= CONVERSATION_TURN_LIMIT:
@@ -212,14 +224,15 @@ def add_text(
             * 6
         )
 
-    if image_flagged:
+    if image_flagged or text_flagged:
         logger.info(f"image flagged. ip: {ip}. text: {text}")
         for i in range(num_sides):
             states[i].skip_next = True
+        gr.Warning(MODERATION_MSG)
         return (
             states
             + [x.to_gradio_chatbot() for x in states]
-            + [{"text": IMAGE_MODERATION_MSG}]
+            + [None]
             + [
                 no_change_btn,
             ]
@@ -229,7 +242,9 @@ def add_text(
     text = text[:INPUT_CHAR_LEN_LIMIT]  # Hard cut-off
     for i in range(num_sides):
         post_processed_text = _prepare_text_with_image(
-            states[i], text, images, csam_flag=csam_flag
+            states[i],
+            text,
+            images,
         )
         states[i].conv.append_message(states[i].conv.roles[0], post_processed_text)
         states[i].conv.append_message(states[i].conv.roles[1], None)
@@ -265,6 +280,7 @@ def build_side_by_side_vision_ui_named(models, random_questions=None):
     states = [gr.State() for _ in range(num_sides)]
     model_selectors = [None] * num_sides
     chatbots = [None] * num_sides
+    content_moderator = gr.State()
 
     notice = gr.Markdown(notice_markdown, elem_id="notice_markdown")
 
